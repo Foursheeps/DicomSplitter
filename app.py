@@ -1,828 +1,1283 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+DICOM Splitter v1.76 - DICOM 序列分割与 NIfTI 转换工具
+优化说明：修复潜在 bug，增强健壮性，优化性能
+
+Copyright (c) 2026 Foursheeps
+Licensed under MIT License
+"""
+
 import os
 import re
-import pydicom
-from loguru import logger
-from func_timeout import func_set_timeout, FunctionTimedOut
-import SimpleITK as sitk
+import sys
+import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+from typing import List, Dict, Optional, Set, Callable, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from threading import Thread
-from dataclasses import dataclass
-from collections import Counter
-
-# from tqdm.auto import tqdm
-
-# from joblib import Parallel, delayed
-# from multiprocessing import freeze_support
-
-_version = "1.74"
-
-
-@logger.catch
-def get_dicom_file(root_path, timeout=2):
-	@func_set_timeout(timeout)
-	def get_dicom_file_inner(root_path):
-		return_files = []
-		for root, dirs, files in os.walk(root_path):
-			if not dirs:
-				for file in files:
-					return_files.append(os.path.join(root, file))
-		return return_files
-
-	try:
-		return get_dicom_file_inner(root_path)
-	except FunctionTimedOut:
-		logger.error(f"Timeout when reading {root_path}.")
-		raise FunctionTimedOut(
-			f"Timeout when reading {root_path}. maybe the path does not contain DICOM files or too many files. "
-			f"If you are sure that the path contains DICOM files, you can increase the timeout limit."
-		)
-
-
-@logger.catch
-def get_metadata(dicom_file, meta_keys=None):
-	try:
-		ds = pydicom.dcmread(dicom_file, force=True)
-	except Exception as e:
-		logger.warning(f"Error in reading {dicom_file}. Error: {e}, Will Skip.")
-		# raise ValueError(f"Error in reading {dicom_file}. Error: {e}")
-		return None
-
-	d = {"file_path": dicom_file}
-
-	for k in meta_keys:
-		d[k] = ds.get(k, "[NA]")
-
-	if "[NA]" == d["AccessionNumber"] or (
-		d["AccessionNumber"] == "" and d["StudyID"] == ""
-	):
-		logger.warning(
-			f"AccessionNumber and StudyID are [NA] in {dicom_file} !!!, will skip."
-		)
-		return None
-
-	if "[NA]" != d["AcquisitionTime"] and d["AcquisitionTime"] != "":
-		d["AcquisitionTime"] = str(round(float(d["AcquisitionTime"])))
-
-	return d
-
-
-def filter_in(x: dict):
-	"""
-	根据序列描述和厂商信息过滤序列
-	x: dict
-	"""
-	if any(  # 通用过滤
-		[
-			i == x["SeriesDescription"].lower()
-			for i in [
-				"localizer",
-				"3-pl loc",
-				"3-pl loc ssfse",
-				"3-pl ssfse loc",
-				"processed images",
-				"screen save",
-				"default ps series",
-				"survey",
-			]
-		]
-	):
-		return False
-
-	if "Philips" in x["Manufacturer"] and (
-		any(  # 有的序列描述中包含以下关键字
-			[
-				i in x["SeriesDescription"]
-				for i in [
-					"RECON",
-				]
-			]
-		)
-		or any(  # 有的序列描述中等于以下关键字
-			[
-				i == x["SeriesDescription"]
-				for i in [
-					"IN",
-					"OP",
-					"WATER",
-					"ALL",
-					"A1",
-					"A2",
-					"A60",
-					"V60",
-					"3min",
-					"8min",
-				]
-			]
-		)
-	):
-		return False
-	if "GE" in x["Manufacturer"] and (
-		any(  # 有的序列描述中包含以下关键字
-			[
-				i in x["SeriesDescription"]
-				for i in [
-					"ORIG",
-					"MPR",
-					"Refomate",
-					"IDEAL IQ",
-				]
-			]
-		)
-		or any(  # 有的序列描述中等于以下关键字
-			i == x["SeriesDescription"]
-			for i in [
-				"Ax LAVA-xv 5",
-				"Ax LAVA-xv 10",
-				"Ax LAVA-xv 15",
-				"Water",
-				"inphase",
-				"outphase",
-				"Processed Images",
-				"LAVA 4 min",
-				"LAVA 5 min",
-				"LAVA 8 min",
-				"InPhase: IDEAL IQ (20sec BH)",
-				"WATER: IDEAL IQ (20sec BH)",
-				"FAT: IDEAL IQ (20sec BH)",
-				"OutPhase: IDEAL IQ (20sec BH)",
-
-				"Ax fs DWI MULTI-b",
-				" Ax fs DWI MULTI-b",
-				"lava 4 min",
-				"lava 5 min",
-				"lava 8 min",
-				"Ax LAVA-xv 5 120min",
-				"Ax LAVA-xv 10 120min",
-				"Ax LAVA-xv 15 120min",
-				"Ax LAVA-xv 5  120min",
-				"Ax LAVA-xv 10  120min",
-				"Ax LAVA-xv 15  120min",
-			]
-		)
-	):
-		return False
-	if "SIEMENS" in x["Manufacturer"] and (
-		any(  # 有的序列描述中包含以下关键字
-			[
-				i in x["SeriesDescription"]
-				for i in [
-					"Map",
-				]
-			]
-		)
-		or any(  # 有的序列描述中等于以下关键字
-			i == x["SeriesDescription"]
-			for i in [
-				"t1_vibe-twist_dixon_tra_p4_bh_pre_TTC=3.4s_F",
-				"t1_vibe-twist_dixon_tra_p4_bh_art_5phases_TTC=7.7s_F",
-				"t1_vibe-twist_dixon_tra_p4_bh_art_5phases_TTC=10.6s_F",
-				"t1_vibe-twist_dixon_tra_p4_bh_art_5phases_TTC=13.4s_F",
-				"t1_vibe-twist_dixon_tra_p4_bh_art_5phases_TTC=19.2s_F",
-				"t1_vibe-twist_dixon_tra_p4_bh_art_5phases_TTC=16.3s_F",
-				"t1_vibe-twist_dixon_tra_p4_50-60s_TTC=3.4s_F",
-				"t1_vibe_dixon_cor_caipi6_bh_4-5min_F",
-				"t1_vibe-twist_dixon_tra_p4_3-4min_TTC=3.4s_F",
-				"t1_vibe-twist_dixon_tra_p4_8min_TTC=3.4s_F",
-				"ep2d_diff_sms4_IVIM_TRACEW_DFC",
-				"t1_1.8mm_dixon_tra_p4_120min_TTC=4.3s_F",
-				"t1_vibe_dixon_cor_caipi6_120min_F",
-				"t1_vibe_twist_dixon_tra_p4_120min_TTC=3.4s_F",
-				"vibe_q-dixon_tra_p4_bh_WF",
-				"vibe_q-dixon_tra_p4_bh_W",
-				"vibe_q-dixon_tra_p4_bh_F",
-			]
-		)
-	):
-		return False
-	return True
-
-
-def sanitize_file_name(file_name):
-	invalid_char_pattern = re.compile(r"[^a-zA-Z0-9._]")
-	sanitized_file_name = invalid_char_pattern.sub("_", file_name)
-	return sanitized_file_name
-
-
-class DicomSeriesSplit:
-	@logger.catch
-	def __init__(
-		self,
-		timeout=4,
-		n_jobs=4,
-		backend=None,
-		min_slices=24,
-		skip_desc=None,
-		filter_func=None,
-		meta_keys=None,
-		will_save_file_keys=None,
-		will_save_folder_keys=None,
-		will_save_root_path=None,
-	):
-		_meta_keys = [
-			"PatientID",
-			"AccessionNumber",
-			"ProtocolName",
-			"Manufacturer",
-			"SeriesInstanceUID",
-			"SliceLocation",
-			"InstanceNumber",
-			"SeriesNumber",
-			"SeriesDescription",
-			"AcquisitionTime",
-			"AcquisitionNumber",
-		]
-		if meta_keys is None:
-			meta_keys = _meta_keys
-		elif set(meta_keys).issubset(_meta_keys):
-			meta_keys = _meta_keys
-		else:
-			meta_keys = list(set(meta_keys).union(_meta_keys))
-
-		if will_save_file_keys is None:
-			will_save_file_keys = ["SeriesDescription"]
-
-		if will_save_folder_keys is None:
-			will_save_folder_keys = ["PatientID", "AccessionNumber"]
-
-		if (
-			will_save_root_path is None
-			or not os.path.isdir(will_save_root_path)
-			or not os.path.exists(will_save_root_path)
-		):
-			raise ValueError("will_save_root_path must be defined in advance")
-
-		self.timeout = timeout
-		self.n_jobs = n_jobs
-		self.backend = backend
-		self.min_slices = min_slices
-		self.meta_keys = meta_keys
-		self.will_save_file_keys = will_save_file_keys
-		self.will_save_folder_keys = will_save_folder_keys
-		self.will_save_root_path = will_save_root_path
-
-		if skip_desc is None:
-			self.skip_desc = {
-				"localizer",
-				"3-pl Loc",
-				"3-Pl Loc SSFSE",
-				"Processed Images",
-				"Screen Save",
-				"DEFAULT PS SERIES",
-				"SURVEY",
-			}
-		else:
-			self.skip_desc = skip_desc
-
-		self.filter_func = filter_func
-
-		logger.info(f"Create {self.__repr__()}")
-
-	def __repr__(self):
-		return (
-			f"DicomSplitter(will_save_file_keys={self.will_save_file_keys} "
-			f"will_save_folder_keys={self.will_save_folder_keys} "
-			f"will_save_root_path={self.will_save_root_path}"
-		)
-
-	@logger.catch
-	def __call__(self, _path):
-		dicom_files = get_dicom_file(_path, timeout=self.timeout)
-		logger.info(f"From {_path} Maybe Get {len(dicom_files)} DICOM files.")
-
-		metadata_list = []
-		for i, file in enumerate(dicom_files):
-			metadata = get_metadata(file, self.meta_keys)
-			metadata_list.append(metadata)
-			logger.info(
-				f"Read {i + 1}/{len(dicom_files)} DICOM files. Success."
-			)
-
-		metadata_list = list(filter(lambda x: x is not None, metadata_list))
-
-		if len(metadata_list) == 0:
-			raise ValueError(f"No valid metadata found in {dicom_files}")
-
-		logger.info(
-			f"Get {len(metadata_list)} DICOM files with valid metadata."
-		)
-
-		metadata_list = list(
-			filter(
-				lambda x: x["SliceLocation"] != "[NA]"
-				and x["AcquisitionTime"] != "[NA]",
-				metadata_list,
-			)
-		)
-
-		if self.filter_func:
-			metadata_list = self.filter_func(metadata_list)
-		else:
-			for key in self.will_save_file_keys:
-				metadata_list = list(
-					filter(
-						lambda x: x[key] not in self.skip_desc, metadata_list
-					)
-				)
-			metadata_list = list(filter(filter_in, metadata_list))
-
-		metadata_list = sorted(
-			metadata_list, key=lambda x: x["AcquisitionTime"]
-		)
-
-		series_dict = {}
-		for metadata in metadata_list:
-			series_instance_uid = metadata["SeriesInstanceUID"]
-			if series_instance_uid not in series_dict:
-				series_dict[series_instance_uid] = []
-			series_dict[series_instance_uid].append(metadata)
-
-		split_list = []
-		index = 0
-		will_save_folder_flag = None
-		for key, value in series_dict.items():
-			if len(value) <= self.min_slices:
-				logger.info(
-					f"Group {key} has {len(value)} slices, less than {self.min_slices}. Skip."
-				)
-				continue
-
-			file_name_s = [
-				sanitize_file_name(value[0][key])
-				for key in self.will_save_file_keys
-			]
-			file_name = "-".join(
-				[x if len(x) != 0 else "None" for x in file_name_s]
-			)
-
-			# if file_name == "BH_Ax_3D_DE_IN_OUT-3T_ABD_CARDIAC_5-154502":
-			# 	pass
-			
-			value = sorted(
-				value, key=lambda x: (x["SliceLocation"], x["InstanceNumber"])
-			)
-
-			aq_numbers = [x["AcquisitionNumber"] for x in value]
-			aq_number_uniques = sorted(set(aq_numbers))
-
-			slice_locations = [x["SliceLocation"] for x in value]
-			slice_location_uniques = sorted(set(slice_locations))
-
-			if len(aq_number_uniques) == 1:
-				use_aq_number = False
-			else:
-				if len(value) % len(slice_location_uniques) == 0 and len(value) % len(aq_number_uniques) == 0:
-					use_aq_number = False
-
-				elif len(value) % len(aq_number_uniques) == 0:
-					aq_numbers2 = list(aq_number_uniques) * (
-						len(value) // len(aq_number_uniques)
-					)
-					if sorted(aq_numbers2) == sorted(aq_numbers):
-						use_aq_number = True
-					else:
-						use_aq_number = False
-
-				else:
-					use_aq_number = False
-
-			if use_aq_number:  # 多序列拆分 使用AcquisitionNumber
-				logger.info(
-					f"Use AcquisitionNumber Will Split {len(aq_number_uniques)} Series."
-				)
-
-				for aq_number in aq_number_uniques:
-					aq_value = [
-						x for x in value if x["AcquisitionNumber"] == aq_number
-					]
-
-					sub_files = [x["file_path"] for x in aq_value]
-
-					# 1.3 sanitize_file_name will_save_folder
-					patient_id = (
-						value[0]["PatientID"]
-						if value[0]["PatientID"] != ""
-						else "NonePatientID"
-					)
-					accession_number = (
-						value[0]["AccessionNumber"]
-						if value[0]["AccessionNumber"] != ""
-						else "NoneAccessionNumber"
-					)
-					study_id = (
-						value[0]["StudyID"]
-						if value[0]["StudyID"] != ""
-						else "NoneStudyID"
-					)
-
-					patient_id = sanitize_file_name(patient_id)
-					accession_number = sanitize_file_name(accession_number)
-					study_id = sanitize_file_name(study_id)
-
-					if (
-						patient_id == "NonePatientID"
-						and accession_number == "NoneAccessionNumber"
-					):
-						logger.warning(
-							f"PatientID and AccessionNumber are [NA] in {sub_files[0]} !!!, will skip."
-						)
-						will_save_folder = (
-							f"NonePatientID/NoneAccessionNumber/{study_id}"
-						)
-					else:
-						will_save_folder = "/".join(
-							[patient_id, accession_number]
-						)
-
-					index = (
-						0
-						if will_save_folder != will_save_folder_flag
-						else index
-					)
-					will_save_folder_flag = will_save_folder
-					series_data = SeriesData(
-						index=index,
-						files=sub_files,
-						will_save_file=f"{file_name}-{aq_number}",
-						will_save_folder=will_save_folder,
-						will_save_root_path=self.will_save_root_path,
-					)
-
-					logger.info(f"Create {series_data} successfully.")
-
-					split_list.append(series_data)
-					index += 1
-			else:  # 当AcquisitionNumber都相同时，尝试使用SliceLocation拆分
-				location_value = [x["SliceLocation"] for x in value]
-
-				location_counter = Counter(location_value)
-
-				if not len(location_counter) == len(value):
-					location_value = [
-						item
-						for item in location_value
-						if location_counter[item] > 1
-					]
-					value = [
-						x for x in value if x["SliceLocation"] in location_value
-					]
-					location_drop = [
-						item
-						for item in location_counter
-						if location_counter[item] == 1
-					]
-					logger.info(
-						f"Group {key} has {len(value)} slices, but only {len(location_value)} unique locations. Will Drop {len(location_drop)} locations."
-					)
-
-				location_uniques = sorted(set(location_value))
-
-				# assert (
-				#     len(value) % len(location_uniques) == 0
-				# ), f"Group {key} has {len(value)} slices, but only {len(location_uniques)} unique locations."
-
-				value_by_location = {}
-				for location in location_uniques:
-					value_by_location[location] = []
-				for v in value:
-					value_by_location[v["SliceLocation"]].append(v)
-
-				split_num = len(value) // len(location_uniques)
-
-				logger.info(f"Use SliceLocation Will Split {split_num} Series.")
-
-				# if len(location_uniques) == 22:
-				#     pass
-
-				for i in range(split_num):
-					sub_files = []
-					for location in location_uniques:
-						sub_files.append(
-							value_by_location[location][i]["file_path"]
-						)
-
-					patient_id = (
-						value[0]["PatientID"]
-						if value[0]["PatientID"] != ""
-						else "NonePatientID"
-					)
-					accession_number = (
-						value[0]["AccessionNumber"]
-						if value[0]["AccessionNumber"] != ""
-						else "NoneAccessionNumber"
-					)
-					study_id = (
-						value[0]["StudyID"]
-						if value[0]["StudyID"] != ""
-						else "NoneStudyID"
-					)
-
-					patient_id = sanitize_file_name(patient_id)
-					accession_number = sanitize_file_name(accession_number)
-					study_id = sanitize_file_name(study_id)
-
-					if (
-						patient_id == "NonePatientID"
-						and accession_number == "NoneAccessionNumber"
-					):
-						logger.warning(
-							f"PatientID and AccessionNumber are [NA] in {sub_files[0]} !!!, will skip."
-						)
-						will_save_folder = (
-							f"NonePatientID/NoneAccessionNumber/{study_id}"
-						)
-					else:
-						will_save_folder = "/".join(
-							[patient_id, accession_number]
-						)
-
-					index = (
-						0
-						if will_save_folder != will_save_folder_flag
-						else index
-					)
-					will_save_folder_flag = will_save_folder
-					series_data = SeriesData(
-						index=index,
-						files=sub_files,
-						will_save_file=f"{file_name}-{i}",
-						will_save_folder=will_save_folder,
-						will_save_root_path=self.will_save_root_path,
-					)
-
-					logger.info(f"Create {series_data} successfully.")
-
-					split_list.append(series_data)
-					index += 1
-
-		self.split_list = split_list
-		return split_list
-
-
+import queue
+
+import pydicom
+from pydicom.errors import InvalidDicomError
+from loguru import logger
+from func_timeout import func_timeout, FunctionTimedOut
+import SimpleITK as sitk
+
+# -------------------------- 全局配置与常量 --------------------------
+DEFAULT_TIMEOUT = 2
+DEFAULT_MIN_SLICES = 10
+DEFAULT_N_JOBS = 4
+LOG_DIR = Path("log")
+LOG_FILE = LOG_DIR / "dicom_splitter_app.log"
+
+# SliceLocation 浮点精度容差
+SLICE_LOCATION_TOLERANCE = 0.001
+
+# 文件名最大长度
+MAX_FILENAME_LENGTH = 200
+
+# 确保日志目录存在
+LOG_DIR.mkdir(exist_ok=True, parents=True)
+
+# 配置日志 - 使用单例模式避免重复配置
+logger.remove()
+logger.add(
+    sys.stderr,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level="INFO"
+)
+logger.add(
+    LOG_FILE,
+    rotation="100 MB",
+    retention="30 days",
+    compression="zip",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+    level="DEBUG"
+)
+
+# -------------------------- 工具函数 --------------------------
+def sanitize_file_name(file_name: Optional[str]) -> str:
+    """
+    清理文件名，移除非法字符并替换为下划线
+
+    Args:
+        file_name: 原始文件名
+
+    Returns:
+        清理后的文件名
+    """
+    if not file_name:
+        return "unknown"
+
+    # 转换为字符串
+    sanitized = str(file_name)
+
+    # 移除或替换非法字符（包括 Windows 和 Unix 的非法字符）
+    sanitized = re.sub(r'[\\/*?:"<>|\[\]\x00-\x1f]', "_", sanitized)
+
+    # 移除前后的空白和点
+    sanitized = sanitized.strip().strip(".")
+
+    # 替换连续的下划线和空格
+    sanitized = re.sub(r"[_\s]+", "_", sanitized)
+
+    # 限制长度
+    if len(sanitized) > MAX_FILENAME_LENGTH:
+        sanitized = sanitized[:MAX_FILENAME_LENGTH - 3] + "..."
+
+    return sanitized if sanitized else "unknown"
+
+
+def safe_get(dicom_obj: Any, tag: str, default: Any = "") -> Any:
+    """
+    安全地获取 DICOM 对象的属性值
+
+    Args:
+        dicom_obj: DICOM 对象
+        tag: 属性名或标签
+        default: 默认值
+
+    Returns:
+        属性值或默认值
+    """
+    try:
+        value = getattr(dicom_obj, tag, default)
+
+        # 处理空值和无效值
+        if value is None or value == "":
+            return default
+
+        # 处理 pydicom 多值类型
+        if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
+            if len(value) == 0:
+                return default
+            if len(value) == 1:
+                value = value[0]
+            else:
+                # 多值情况返回第一个值
+                value = value[0]
+
+        # 转换为字符串并清理
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return default
+
+        return value
+    except Exception:
+        return default
+
+
+def is_dicom_file(file_path: Path, timeout: int = DEFAULT_TIMEOUT) -> bool:
+    """
+    检查文件是否为有效的 DICOM 文件
+
+    Args:
+        file_path: 文件路径
+        timeout: 超时时间（秒）
+
+    Returns:
+        是否为 DICOM 文件
+    """
+    try:
+        def check():
+            with open(file_path, "rb") as f:
+                # 尝试读取 DICOM 前缀
+                f.seek(128)
+                prefix = f.read(4)
+                if prefix == b"DICM":
+                    return True
+                # 尝试直接读取（一些 DICOM 文件没有前缀）
+                f.seek(0)
+                try:
+                    pydicom.dcmread(f, stop_before_pixels=True, force=True)
+                    return True
+                except Exception:
+                    return False
+
+        return func_timeout(timeout, check)
+    except FunctionTimedOut:
+        logger.warning(f"检查文件类型超时: {file_path}")
+        return False
+    except Exception as e:
+        logger.debug(f"检查文件类型失败 {file_path}: {e}")
+        return False
+
+
+def get_dicom_file(root_path: str, timeout: int = DEFAULT_TIMEOUT) -> List[Path]:
+    """
+    递归获取目录下所有 DICOM 文件，带超时保护
+
+    Args:
+        root_path: 根目录路径
+        timeout: 单个文件读取超时时间（秒）
+
+    Returns:
+        DICOM 文件路径列表
+    """
+    dicom_files: List[Path] = []
+    root = Path(root_path)
+
+    if not root.exists():
+        logger.error(f"路径不存在: {root_path}")
+        return dicom_files
+
+    if not root.is_dir():
+        logger.error(f"路径不是目录: {root_path}")
+        return dicom_files
+
+    logger.info(f"开始扫描目录: {root_path}")
+
+    # 跳过的文件扩展名
+    skip_extensions = {
+        ".txt", ".csv", ".json", ".xml", ".log",
+        ".zip", ".tar", ".gz", ".bz2", ".7z",
+        ".nii", ".nii.gz", ".img", ".hdr",
+        ".exe", ".dll", ".so", ".dylib",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx"
+    }
+
+    file_count = 0
+    for file_path in root.rglob("*"):
+        if not file_path.is_file():
+            continue
+
+        file_count += 1
+
+        # 跳过明显不是 DICOM 的文件
+        suffix = file_path.suffix.lower()
+        if suffix in skip_extensions:
+            continue
+
+        # 检查文件大小（DICOM 文件通常大于 100 字节）
+        try:
+            stat = file_path.stat()
+            if stat.st_size < 100:
+                continue
+        except Exception:
+            continue
+
+        # 检查是否为 DICOM 文件
+        if is_dicom_file(file_path, timeout):
+            dicom_files.append(file_path)
+
+    logger.info(f"扫描完成，共检查 {file_count} 个文件，找到 {len(dicom_files)} 个 DICOM 文件")
+    return dicom_files
+
+
+def get_metadata(dicom_file: Path, meta_keys: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """
+    提取 DICOM 文件的元数据
+
+    Args:
+        dicom_file: DICOM 文件路径
+        meta_keys: 要提取的元数据键列表，None 则提取默认键
+
+    Returns:
+        元数据字典，失败返回 None
+    """
+    default_keys = [
+        "PatientID", "PatientName", "StudyInstanceUID", "StudyID",
+        "SeriesInstanceUID", "SeriesDescription", "ProtocolName",
+        "AccessionNumber", "AcquisitionNumber", "SliceLocation",
+        "InstanceNumber", "AcquisitionTime", "Manufacturer",
+        "Rows", "Columns", "ImageOrientationPatient"
+    ]
+
+    if meta_keys is None:
+        meta_keys = default_keys
+
+    metadata: Dict[str, Any] = {
+        "file_path": str(dicom_file),
+        "file_name": dicom_file.name
+    }
+
+    try:
+        ds = pydicom.dcmread(dicom_file, stop_before_pixels=True, force=True)
+
+        # 验证是否为有效的 DICOM 文件
+        if not hasattr(ds, 'file_meta') and not hasattr(ds, 'SeriesInstanceUID'):
+            logger.debug(f"可能不是有效的 DICOM 文件: {dicom_file}")
+
+        for key in meta_keys:
+            value = safe_get(ds, key)
+            metadata[key] = value
+
+        # 特殊处理数字类型
+        for num_key in ["AcquisitionNumber", "InstanceNumber", "Rows", "Columns"]:
+            try:
+                if num_key in metadata and metadata[num_key] is not None:
+                    val = float(metadata[num_key])
+                    if val.is_integer():
+                        metadata[num_key] = int(val)
+                    else:
+                        metadata[num_key] = val
+            except (ValueError, TypeError):
+                metadata[num_key] = 0 if num_key in ["Rows", "Columns"] else None
+
+        # 特殊处理 SliceLocation
+        try:
+            if "SliceLocation" in metadata and metadata["SliceLocation"] is not None:
+                metadata["SliceLocation"] = float(metadata["SliceLocation"])
+        except (ValueError, TypeError):
+            metadata["SliceLocation"] = None
+
+        # 处理 AcquisitionTime 格式
+        if "AcquisitionTime" in metadata and metadata["AcquisitionTime"]:
+            time_str = str(metadata["AcquisitionTime"])
+            # 只保留 HHMMSS 格式
+            if "." in time_str:
+                time_str = time_str.split(".")[0]
+            metadata["AcquisitionTime"] = time_str[:6] if len(time_str) >= 6 else time_str
+
+        return metadata
+
+    except InvalidDicomError:
+        logger.warning(f"无效的 DICOM 文件: {dicom_file}")
+    except Exception as e:
+        logger.error(f"读取 DICOM 元数据失败: {dicom_file}, 错误: {str(e)}")
+
+    return None
+
+
+def filter_in(x: Dict[str, Any]) -> bool:
+    """
+    根据序列描述和厂商信息过滤序列
+
+    Args:
+        x: 序列元数据字典
+
+    Returns:
+        True 表示保留，False 表示过滤
+    """
+    desc = str(x.get("SeriesDescription", "")).lower().strip()
+    protocol = str(x.get("ProtocolName", "")).lower().strip()
+    manufacturer = str(x.get("Manufacturer", "")).lower().strip()
+
+    # 如果描述和协议名都为空，保留（可能是特殊序列）
+    if not desc and not protocol:
+        return True
+
+    # -------------------------- 通用过滤规则 --------------------------
+    generic_skip_patterns = {
+        "localizer", "survey", "3-pl loc", "3-pl ssfse loc", "3-pl loc ssfse",
+        "processed images", "screen save", "default ps series", "scout",
+        "dose report", "dose info", "dose summary", "save"
+    }
+
+    for pattern in generic_skip_patterns:
+        if pattern in desc or pattern in protocol:
+            logger.debug(f"过滤序列（通用规则）: {desc or protocol}")
+            return False
+
+    # -------------------------- 厂商特定过滤规则 --------------------------
+    # 提取干净的描述用于精确匹配
+    desc_clean = desc.strip().lower()
+
+    # Philips 特定过滤
+    if "philips" in manufacturer:
+        philips_skip_patterns = {"recon"}
+        philips_skip_exact = {"in", "op", "water", "all", "a1", "a2", "a60", "v60", "3min", "8min"}
+
+        for pattern in philips_skip_patterns:
+            if pattern in desc or pattern in protocol:
+                logger.debug(f"过滤序列（Philips 规则）: {desc}")
+                return False
+
+        if desc_clean in philips_skip_exact:
+            logger.debug(f"过滤序列（Philips 精确匹配）: {desc}")
+            return False
+
+    # GE 特定过滤
+    if "ge" in manufacturer or "general electric" in manufacturer:
+        ge_skip_patterns = {"orig", "mpr", "refomate", "reformate", "ideal iq", "calibration"}
+        ge_skip_exact = {
+            "water", "inphase", "outphase", "opposed", "fat", "ip", "op",
+            "lava-flex", "lava flex", "lava_ax", "lava_cor"
+        }
+
+        for pattern in ge_skip_patterns:
+            if pattern in desc or pattern in protocol:
+                logger.debug(f"过滤序列（GE 规则）: {desc}")
+                return False
+
+        if desc_clean in ge_skip_exact:
+            logger.debug(f"过滤序列（GE 精确匹配）: {desc}")
+            return False
+
+    # SIEMENS 特定过滤
+    if "siemens" in manufacturer:
+        siemens_skip_patterns = {"map", "b0map", "b1map", "fieldmap"}
+        siemens_skip_exact = {
+            "water", "in", "opp", "fat", "inphase", "outphase", "opposed",
+            "vibe dixon", "vibe_dixon", "dixon vibe", "t1_vibe_dixon"
+        }
+
+        for pattern in siemens_skip_patterns:
+            if pattern in desc or pattern in protocol:
+                logger.debug(f"过滤序列（SIEMENS 规则）: {desc}")
+                return False
+
+        if desc_clean in siemens_skip_exact:
+            logger.debug(f"过滤序列（SIEMENS 精确匹配）: {desc}")
+            return False
+
+    return True
+
+
+# -------------------------- 核心数据类 --------------------------
 @dataclass
 class SeriesData:
-	index: int
-	files: list
-	will_save_file: str
-	will_save_folder: str
-	will_save_root_path: str
+    """
+    存储单个序列的数据，提供转换为 ITK 图像和保存为 NIfTI 的方法
+    """
+    files: List[str]
+    metadata: Dict[str, Any]
+    will_save_file_keys: List[str] = field(default_factory=lambda: ["SeriesDescription", "ProtocolName", "AcquisitionTime"])
+    will_save_folder_keys: List[str] = field(default_factory=lambda: ["PatientID", "AccessionNumber"])
+    will_save_root_path: Optional[str] = None
 
-	def __repr__(self):
-		return f"SeriesData(index={self.index}, will_save_file={self.will_save_file}, files_length={len(self.files)})"
+    def __post_init__(self):
+        """初始化后处理"""
+        # 确保文件列表已排序
+        self.files = sorted(self.files)
 
-	@logger.catch
-	def to_itk(self):
-		reader = sitk.ImageSeriesReader()
-		reader.SetFileNames(self.files)
-		image = reader.Execute()
+        # 验证文件列表
+        if not self.files:
+            logger.warning("SeriesData 被创建时没有文件")
 
-		return image
+    def get_folder_name(self) -> str:
+        """
+        获取保存文件夹名称
 
-	@logger.catch
-	def to_save_nifti(self):
-		save_path = os.path.join(
-			self.will_save_root_path, self.will_save_folder
-		)
-		if not os.path.exists(save_path):
-			os.makedirs(save_path)
+        Returns:
+            文件夹名称
+        """
+        parts = []
+        for key in self.will_save_folder_keys:
+            value = str(self.metadata.get(key, f"unknown_{key}"))
+            # 使用 StudyID 作为 AccessionNumber 的备选
+            if key == "AccessionNumber" and (not value or value == "unknown_AccessionNumber"):
+                value = str(self.metadata.get("StudyID", "unknown"))
+            parts.append(sanitize_file_name(value))
 
-		save_file = os.path.join(
-			save_path,
-			f"{self.index:02d}-L{len(self.files):03d}-{self.will_save_file}.nii.gz",
-		)
-		if os.path.exists(save_file):
-			logger.info(f"File {save_file} already exists. Skip.")
-			return
+        return os.path.join(*parts) if parts else "unknown"
 
-		image = self.to_itk()
+    def get_file_name(self, index: int, length: int, split_index: int = 0) -> str:
+        """
+        获取保存文件名
 
-		sitk.WriteImage(image, save_file, True)
-		logger.info(f"Save file {save_file} successfully.")
+        Args:
+            index: 序列索引
+            length: 切片数量
+            split_index: 多序列拆分标号
+
+        Returns:
+            文件名
+        """
+        parts = [f"{index:02d}", f"L{length:03d}"]
+
+        for key in self.will_save_file_keys:
+            value = str(self.metadata.get(key, f"unknown_{key}"))
+            if value and value != f"unknown_{key}":
+                parts.append(sanitize_file_name(value))
+
+        parts.append(f"{split_index}")
+        return "-".join(parts) + ".nii.gz"
+
+    def to_itk_image(self) -> Optional[sitk.Image]:
+        """
+        转换为 ITK 图像
+
+        Returns:
+            ITK 图像对象，失败返回 None
+        """
+        if not self.files:
+            logger.error("没有文件可以转换")
+            return None
+
+        # 检查文件是否存在
+        existing_files = [f for f in self.files if os.path.exists(f)]
+        if not existing_files:
+            logger.error(f"所有文件都不存在: {self.files[:3]}...")
+            return None
+
+        if len(existing_files) != len(self.files):
+            logger.warning(f"部分文件不存在，将使用 {len(existing_files)}/{len(self.files)} 个文件")
+
+        try:
+            reader = sitk.ImageSeriesReader()
+            reader.SetFileNames(existing_files)
+            reader.LoadPrivateTagsOn()
+            image = reader.Execute()
+
+            # 设置元数据
+            for key, value in self.metadata.items():
+                try:
+                    if value is not None and str(value):
+                        image.SetMetaData(key, str(value))
+                except Exception:
+                    pass
+
+            return image
+        except Exception as e:
+            logger.error(f"转换为 ITK 图像失败: {str(e)}")
+            return None
+
+    def to_save_nifti(self, index: int = 0, split_index: int = 0) -> Optional[Path]:
+        """
+        保存为 NIfTI 文件
+
+        Args:
+            index: 序列索引
+            split_index: 多序列拆分标号
+
+        Returns:
+            保存的文件路径，失败返回 None
+        """
+        if self.will_save_root_path is None:
+            logger.error("保存路径未设置")
+            return None
+
+        try:
+            root_path = Path(self.will_save_root_path)
+
+            # 检查并创建保存目录
+            if not root_path.exists():
+                root_path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"创建保存目录: {root_path}")
+
+            # 检查写入权限
+            if not os.access(root_path, os.W_OK):
+                logger.error(f"保存路径没有写入权限: {root_path}")
+                return None
+
+            folder_name = self.get_folder_name()
+            save_dir = root_path / folder_name
+            save_dir.mkdir(exist_ok=True, parents=True)
+
+            length = len(self.files)
+            file_name = self.get_file_name(index, length, split_index)
+            save_path = save_dir / file_name
+
+            # 检查文件是否已存在
+            if save_path.exists():
+                logger.warning(f"文件已存在，跳过: {save_path}")
+                return save_path
+
+            # 转换并保存
+            image = self.to_itk_image()
+            if image is None:
+                return None
+
+            writer = sitk.ImageFileWriter()
+            writer.SetFileName(str(save_path))
+            writer.UseCompressionOn()
+            writer.Execute(image)
+
+            logger.info(f"保存成功: {save_path}")
+            return save_path
+
+        except PermissionError:
+            logger.error(f"保存 NIfTI 文件失败: 权限不足")
+        except Exception as e:
+            logger.error(f"保存 NIfTI 文件失败: {str(e)}")
+        return None
+
+
+# -------------------------- 核心分割类 --------------------------
+class DicomSeriesSplit:
+    """
+    DICOM 序列分割核心类
+    """
+
+    def __init__(
+        self,
+        timeout: int = DEFAULT_TIMEOUT,
+        n_jobs: int = DEFAULT_N_JOBS,
+        backend: Optional[str] = None,
+        min_slices: int = DEFAULT_MIN_SLICES,
+        skip_desc: Optional[Set[str]] = None,
+        filter_func: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        meta_keys: Optional[List[str]] = None,
+        will_save_file_keys: Optional[List[str]] = None,
+        will_save_folder_keys: Optional[List[str]] = None,
+        will_save_root_path: Optional[str] = None
+    ):
+        self.timeout = max(1, timeout)  # 确保至少 1 秒
+        self.n_jobs = max(1, n_jobs)    # 确保至少 1 个线程
+        self.backend = backend
+        self.min_slices = max(1, min_slices)  # 确保至少 1 个切片
+        self.skip_desc = {d.lower().strip() for d in (skip_desc or set())}
+        self.filter_func = filter_func or filter_in
+        self.meta_keys = meta_keys
+        self.will_save_file_keys = will_save_file_keys or ["SeriesDescription", "ProtocolName", "AcquisitionTime"]
+        self.will_save_folder_keys = will_save_folder_keys or ["PatientID", "AccessionNumber"]
+        self.will_save_root_path = will_save_root_path
+
+        # 验证保存路径
+        if will_save_root_path and not self._validate_save_path(will_save_root_path):
+            logger.warning(f"保存路径可能无效: {will_save_root_path}")
+
+        logger.info(f"DicomSeriesSplit 初始化完成，min_slices={self.min_slices}, timeout={self.timeout}, n_jobs={self.n_jobs}")
+
+    def _validate_save_path(self, path: str) -> bool:
+        """验证保存路径是否可写"""
+        try:
+            p = Path(path)
+            if p.exists():
+                return os.access(p, os.W_OK)
+            # 尝试创建目录
+            p.mkdir(parents=True, exist_ok=True)
+            return True
+        except Exception as e:
+            logger.error(f"保存路径验证失败: {e}")
+            return False
+
+    def _read_metadata_parallel(self, dicom_files: List[Path]) -> List[Dict[str, Any]]:
+        """
+        并行读取 DICOM 文件元数据
+
+        Args:
+            dicom_files: DICOM 文件路径列表
+
+        Returns:
+            元数据列表
+        """
+        metadata_list: List[Dict[str, Any]] = []
+
+        if not dicom_files:
+            return metadata_list
+
+        logger.info(f"开始读取 {len(dicom_files)} 个文件的元数据 (使用 {self.n_jobs} 个线程)")
+        start_time = time.time()
+
+        # 单线程模式（对于少量文件更高效）
+        if len(dicom_files) < 10 or self.n_jobs == 1:
+            for file_path in dicom_files:
+                metadata = get_metadata(file_path, self.meta_keys)
+                if metadata:
+                    metadata_list.append(metadata)
+        else:
+            # 多线程模式
+            with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+                futures = {
+                    executor.submit(get_metadata, file, self.meta_keys): file
+                    for file in dicom_files
+                }
+
+                for future in as_completed(futures):
+                    file = futures[future]
+                    try:
+                        metadata = future.result()
+                        if metadata:
+                            metadata_list.append(metadata)
+                    except Exception as e:
+                        logger.error(f"读取文件 {file} 元数据失败: {str(e)}")
+
+        elapsed = time.time() - start_time
+        logger.info(f"成功读取 {len(metadata_list)}/{len(dicom_files)} 个文件的元数据，耗时 {elapsed:.2f} 秒")
+        return metadata_list
+
+    def _group_by_series(self, metadata_list: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        根据 SeriesInstanceUID 分组
+
+        Args:
+            metadata_list: 元数据列表
+
+        Returns:
+            分组后的字典，key 为 SeriesInstanceUID，value 为元数据列表
+        """
+        series_groups: Dict[str, List[Dict[str, Any]]] = {}
+
+        for metadata in metadata_list:
+            if not metadata:
+                continue
+
+            # 检查是否有有效的 SeriesInstanceUID
+            series_uid = str(metadata.get("SeriesInstanceUID", "")).strip()
+            if not series_uid or series_uid == "None" or series_uid == "":
+                logger.debug(f"文件缺少 SeriesInstanceUID，尝试使用 StudyID+SeriesDescription 组合")
+                study_uid = str(metadata.get("StudyInstanceUID", "unknown"))
+                series_desc = str(metadata.get("SeriesDescription", "unknown"))
+                series_uid = f"{study_uid}_{series_desc}"
+
+            # 检查是否符合过滤规则
+            try:
+                if not self.filter_func(metadata):
+                    continue
+            except Exception as e:
+                logger.warning(f"过滤函数执行失败: {e}")
+
+            # 检查自定义跳过规则
+            desc = str(metadata.get("SeriesDescription", "")).lower().strip()
+            if desc in self.skip_desc:
+                logger.debug(f"跳过序列（自定义规则）: {desc}")
+                continue
+
+            # 添加到分组
+            if series_uid not in series_groups:
+                series_groups[series_uid] = []
+            series_groups[series_uid].append(metadata)
+
+        logger.info(f"分组完成，共 {len(series_groups)} 个序列")
+        return series_groups
+
+    def _split_series_by_acquisition_number(self, series_metadata: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """
+        根据 AcquisitionNumber 拆分序列
+
+        Args:
+            series_metadata: 序列元数据列表
+
+        Returns:
+            拆分后的子序列列表
+        """
+        if not series_metadata:
+            return []
+
+        # 检查是否有足够的 AcquisitionNumber 值
+        acq_numbers: Set[int] = set()
+        for md in series_metadata:
+            acq_num = md.get("AcquisitionNumber")
+            if acq_num is not None and isinstance(acq_num, (int, float)):
+                acq_numbers.add(int(acq_num))
+
+        if len(acq_numbers) <= 1:
+            return [series_metadata]
+
+        # 检查是否应该使用 AcquisitionNumber 拆分（避免同反相位等特殊情况）
+        first_md = series_metadata[0]
+        desc = str(first_md.get("SeriesDescription", "")).lower()
+        protocol = str(first_md.get("ProtocolName", "")).lower()
+
+        in_phase_terms = ["inphase", "in_phase", "in phase", "ip", "water", "in-phase"]
+        out_phase_terms = ["outphase", "opposed", "op", "fat", "dixon", "out-phase", "opposed-phase"]
+
+        has_in_phase = any(term in desc or term in protocol for term in in_phase_terms)
+        has_out_phase = any(term in desc or term in protocol for term in out_phase_terms)
+
+        if has_in_phase and has_out_phase:
+            logger.debug("检测到同反相位序列，不使用 AcquisitionNumber 拆分")
+            return [series_metadata]
+
+        # 检查 AcquisitionNumber 分布是否合理
+        slices_per_acq: Dict[int, int] = {}
+        for md in series_metadata:
+            acq_num = md.get("AcquisitionNumber")
+            if acq_num is not None:
+                try:
+                    acq_num_int = int(acq_num)
+                    slices_per_acq[acq_num_int] = slices_per_acq.get(acq_num_int, 0) + 1
+                except (ValueError, TypeError):
+                    pass
+
+        if not slices_per_acq:
+            return [series_metadata]
+
+        # 如果某个 AcquisitionNumber 的切片数太少，不拆分
+        min_count = min(slices_per_acq.values())
+        threshold = max(3, self.min_slices // 2)
+        if min_count < threshold:
+            logger.debug(f"部分 AcquisitionNumber 切片数太少 (min={min_count}, threshold={threshold})，不拆分")
+            return [series_metadata]
+
+        # 执行拆分
+        split_groups: Dict[int, List[Dict[str, Any]]] = {}
+        for md in series_metadata:
+            acq_num = md.get("AcquisitionNumber")
+            if acq_num is None:
+                acq_num = 0
+            try:
+                acq_num_int = int(acq_num)
+            except (ValueError, TypeError):
+                acq_num_int = 0
+
+            if acq_num_int not in split_groups:
+                split_groups[acq_num_int] = []
+            split_groups[acq_num_int].append(md)
+
+        result = list(split_groups.values())
+        logger.debug(f"使用 AcquisitionNumber 拆分，共 {len(result)} 个子序列")
+        return result
+
+    def _split_series_by_slice_location(self, series_metadata: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """
+        根据 SliceLocation 拆分序列
+
+        Args:
+            series_metadata: 序列元数据列表
+
+        Returns:
+            拆分后的子序列列表
+        """
+        if not series_metadata:
+            return []
+
+        # 检查 SliceLocation 是否有效
+        valid_locations: List[float] = []
+        for md in series_metadata:
+            loc = md.get("SliceLocation")
+            if loc is not None and isinstance(loc, (int, float)):
+                valid_locations.append(float(loc))
+
+        if len(valid_locations) < len(series_metadata) // 2:
+            logger.debug(f"有效 SliceLocation 太少 ({len(valid_locations)}/{len(series_metadata)})，不拆分")
+            return [series_metadata]
+
+        # 检查是否有重复的 SliceLocation
+        location_counts: Dict[float, int] = {}
+
+        for loc in valid_locations:
+            rounded_loc = round(loc / SLICE_LOCATION_TOLERANCE) * SLICE_LOCATION_TOLERANCE
+            location_counts[rounded_loc] = location_counts.get(rounded_loc, 0) + 1
+
+        # 检查是否有足够多的重复位置
+        duplicate_count = sum(1 for cnt in location_counts.values() if cnt > 1)
+        if duplicate_count < 5:
+            logger.debug(f"重复 SliceLocation 太少 ({duplicate_count})，不拆分")
+            return [series_metadata]
+
+        # 执行拆分
+        split_groups: Dict[float, List[Dict[str, Any]]] = {}
+        for md in series_metadata:
+            loc = md.get("SliceLocation")
+            if loc is None:
+                continue
+            rounded_loc = round(float(loc) / SLICE_LOCATION_TOLERANCE) * SLICE_LOCATION_TOLERANCE
+            if rounded_loc not in split_groups:
+                split_groups[rounded_loc] = []
+            split_groups[rounded_loc].append(md)
+
+        # 如果没有足够的分组，返回原序列
+        if len(split_groups) <= 1:
+            return [series_metadata]
+
+        # 按 InstanceNumber 排序每个分组
+        for group in split_groups.values():
+            group.sort(key=lambda x: int(x.get("InstanceNumber", 0) or 0))
+
+        # 过滤掉切片数太少的分组
+        result = []
+        for group in split_groups.values():
+            if len(group) >= self.min_slices:
+                result.append(group)
+
+        # 如果没有足够的分组，返回原序列
+        if len(result) <= 1:
+            logger.debug(f"拆分后有效子序列太少 ({len(result)})，返回原序列")
+            return [series_metadata]
+
+        logger.debug(f"使用 SliceLocation 拆分，共 {len(result)} 个子序列")
+        return result
+
+    def _process_series(self, series_metadata: List[Dict[str, Any]]) -> List[SeriesData]:
+        """
+        处理单个序列，包括拆分和过滤
+
+        Args:
+            series_metadata: 序列元数据列表
+
+        Returns:
+            SeriesData 对象列表
+        """
+        result: List[SeriesData] = []
+
+        # 检查切片数量
+        if len(series_metadata) < self.min_slices:
+            logger.debug(f"序列切片数 {len(series_metadata)} 小于最小值 {self.min_slices}，跳过")
+            return result
+
+        # 尝试按 AcquisitionNumber 拆分
+        split_by_acq = self._split_series_by_acquisition_number(series_metadata)
+
+        # 如果没有拆分成功，尝试按 SliceLocation 拆分
+        if len(split_by_acq) == 1:
+            split_by_loc = self._split_series_by_slice_location(series_metadata)
+            split_groups = split_by_loc
+        else:
+            split_groups = split_by_acq
+
+        # 处理每个拆分后的子序列
+        for split_idx, group in enumerate(split_groups):
+            if len(group) < self.min_slices:
+                logger.debug(f"子序列切片数 {len(group)} 小于最小值 {self.min_slices}，跳过")
+                continue
+
+            # 获取文件路径列表
+            files = [md.get("file_path", "") for md in group if md.get("file_path")]
+            if not files:
+                logger.warning("子序列没有有效的文件路径")
+                continue
+
+            # 使用第一个文件的元数据作为序列元数据
+            base_metadata = group[0].copy()
+            base_metadata["slice_count"] = len(group)
+            base_metadata["split_index"] = split_idx
+
+            # 创建 SeriesData 对象
+            try:
+                series_data = SeriesData(
+                    files=files,
+                    metadata=base_metadata,
+                    will_save_file_keys=self.will_save_file_keys,
+                    will_save_folder_keys=self.will_save_folder_keys,
+                    will_save_root_path=self.will_save_root_path
+                )
+                result.append(series_data)
+            except Exception as e:
+                logger.error(f"创建 SeriesData 失败: {e}")
+
+        return result
+
+    def __call__(self, root_path: str) -> List[SeriesData]:
+        """
+        处理 DICOM 文件
+
+        Args:
+            root_path: DICOM 文件根目录
+
+        Returns:
+            SeriesData 对象列表
+        """
+        if not root_path or not isinstance(root_path, str):
+            logger.error(f"无效的根路径: {root_path}")
+            return []
+
+        logger.info(f"开始处理目录: {root_path}")
+        start_time = time.time()
+
+        # 步骤 1: 获取所有 DICOM 文件
+        dicom_files = get_dicom_file(root_path, self.timeout)
+        if not dicom_files:
+            logger.warning("未找到 DICOM 文件")
+            return []
+
+        # 步骤 2: 读取元数据
+        metadata_list = self._read_metadata_parallel(dicom_files)
+        if not metadata_list:
+            logger.warning("未读取到任何元数据")
+            return []
+
+        # 步骤 3: 按 SeriesInstanceUID 分组
+        series_groups = self._group_by_series(metadata_list)
+        if not series_groups:
+            logger.warning("没有符合条件的序列")
+            return []
+
+        # 步骤 4: 处理每个序列
+        all_series: List[SeriesData] = []
+        for series_uid, series_metadata in series_groups.items():
+            try:
+                series_list = self._process_series(series_metadata)
+                all_series.extend(series_list)
+            except Exception as e:
+                logger.error(f"处理序列 {series_uid} 失败: {e}")
+
+        elapsed = time.time() - start_time
+        logger.info(f"处理完成，共得到 {len(all_series)} 个有效序列，耗时 {elapsed:.2f} 秒")
+        return all_series
+
+
+# -------------------------- GUI 界面 --------------------------
+class GuiLogHandler:
+    """GUI 日志处理器"""
+
+    def __init__(self, text_widget: tk.Text, log_queue: queue.Queue):
+        self.text_widget = text_widget
+        self.log_queue = log_queue
+        self._running = True
+
+    def write(self, message: str):
+        """将日志消息放入队列"""
+        if self._running:
+            try:
+                self.log_queue.put(message, block=False)
+            except queue.Full:
+                pass
+
+    def flush(self):
+        pass
+
+    def stop(self):
+        self._running = False
 
 
 class DicomApp:
-	def __init__(self, root):
-		self.root = root
-		self.root.title(f"DICOM Splitter v{_version}")
-		self.root.geometry("800x630")
+    """
+    DICOM Splitter GUI 界面
+    """
 
-		self.label = tk.Label(root, text="Select DICOM Root Path:")
-		self.label.grid(row=0, column=0, padx=10, pady=10, sticky=tk.W)
-		self.path_entry = tk.Entry(root, width=70)
-		self.path_entry.grid(row=0, column=1, padx=10, pady=10)
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("DICOM Splitter v1.76")
+        self.root.geometry("900x700")
+        self.root.resizable(True, True)
 
-		self.save_label = tk.Label(root, text="Select NIFTI Save Path:")
-		self.save_label.grid(row=1, column=0, padx=10, pady=10, sticky=tk.W)
-		self.save_entry = tk.Entry(root, width=70)
-		self.save_entry.grid(row=1, column=1, padx=10, pady=10)
+        # 变量
+        self.dicom_path_var = tk.StringVar()
+        self.save_path_var = tk.StringVar()
+        self.min_slices_var = tk.IntVar(value=DEFAULT_MIN_SLICES)
+        self.timeout_var = tk.IntVar(value=DEFAULT_TIMEOUT)
+        self.n_jobs_var = tk.IntVar(value=DEFAULT_N_JOBS)
+        self.running = False
 
-		self.browse_button = tk.Button(
-			root, text="Browse", command=self.browse_dicom
-		)
-		self.browse_button.grid(row=0, column=2, padx=10, pady=10)
-		self.save_button = tk.Button(
-			root, text="Browse", command=self.browse_save
-		)
-		self.save_button.grid(row=1, column=2, padx=10, pady=10)
-		self.run_button = tk.Button(root, text="Run", command=self.run)
-		self.run_button.grid(row=2, column=2, padx=10, pady=20)
+        # 日志队列
+        self.log_queue: queue.Queue = queue.Queue(maxsize=1000)
+        self.gui_handler: Optional[GuiLogHandler] = None
+        self._log_after_id: Optional[str] = None
 
-		self.min_slices_label = tk.Label(
-			root, text="Minimum Slices(排除的最小序列长度):"
-		)
-		self.min_slices_label.grid(
-			row=2, column=0, padx=10, pady=10, sticky=tk.W
-		)
-		self.min_slices_entry = tk.Entry(root, width=20)
-		self.min_slices_entry.grid(
-			row=2, column=1, padx=10, pady=10, sticky=tk.W
-		)
-		self.min_slices_entry.insert(0, "10")
+        # 设置窗口样式
+        self._setup_style()
 
-		self.timeout_label = tk.Label(
-			root, text="Timeout (seconds, 防止程序卡死):"
-		)
-		self.timeout_label.grid(row=3, column=0, padx=10, pady=10, sticky=tk.W)
-		self.timeout_entry = tk.Entry(root, width=20)
-		self.timeout_entry.grid(row=3, column=1, padx=10, pady=10, sticky=tk.W)
-		self.timeout_entry.insert(0, "2")
+        # 创建界面
+        self._create_widgets()
 
-		save_file_format_example = (
-			"Save File Format: SAVEPATH/PatientID/AccessionNumber/"
-			"[Index]-L[length]-[SeriesDescription]-[ProtocolName]-[AcquisitionTime]-[I].nii.gz\n"
-			"SAVEPATH: 保存文位置\t\tPatientID: 病人ID\t\tAccessionNumber: 检查号\n"
-			"Index: 序列索引\t\t\tlength: 该序列长度\t\tSeriesDescription: 系列描述\n"
-			"ProtocolName: 协议名称\t\tI: 多序列拆分标号\t\tAcquisitionTime: 序列采集时间\n"
-		)
-		self.save_file_format_label = tk.Label(
-			root, text=save_file_format_example, justify=tk.LEFT, wraplength=700
-		)
-		self.save_file_format_label.grid(
-			row=4, column=0, columnspan=3, padx=2, pady=2, sticky=tk.W
-		)
+        # 重定向日志到 GUI
+        self._setup_logging()
 
-		user_manual = (
-			"This is a DICOM Splitter."
-			"You can use it to split DICOM files into series and save them as NIfTI files.\n"
-			"  1. Select a DICOM root path.\n"
-			"  2. Select a save path.\n"
-			"  3. Set the minimum number of slices for a series.\n"
-			"  4. Set the timeout for reading DICOM files.\n"
-			"  5. Click 'Run' to start the splitting process."
-		)
-		self.user_manual_label = tk.Label(
-			root, text=user_manual, justify=tk.LEFT, wraplength=700
-		)
-		self.user_manual_label.grid(
-			row=5, column=0, columnspan=3, padx=2, pady=2, sticky=tk.W
-		)
+        # 启动日志更新循环
+        self._update_log()
 
-		delveoper_info = "Name: Luoyang\nEmail: luoyang@stu.xidian.edu.cn"
+        logger.info("DICOM Splitter v1.76 启动成功")
 
-		self.developer_label = tk.Label(
-			root, text=delveoper_info, justify=tk.LEFT, wraplength=700
-		)
-		self.developer_label.grid(
-			row=6, column=1, columnspan=2, padx=10, pady=10, sticky=tk.E
-		)
+    def _setup_style(self):
+        """设置界面样式"""
+        style = ttk.Style()
+        style.theme_use("clam")
 
-		self.log_label = tk.Label(root, text="Log:")
-		self.log_label.grid(row=6, column=0, padx=5, pady=5, sticky=tk.W)
-		self.log_area = scrolledtext.ScrolledText(
-			root, wrap=tk.WORD, width=100, height=10, state="disabled"
-		)
-		self.log_area.grid(
-			row=7,
-			column=0,
-			columnspan=2,
-			padx=1,
-			pady=0,
-			sticky=tk.W + tk.E + tk.N + tk.S,
-		)
+        # 配置样式
+        style.configure("Title.TLabel", font=("Arial", 12, "bold"))
+        style.configure("Header.TFrame", background="#f0f0f0")
+        style.configure("Log.TFrame", background="#1e1e1e")
 
-		# 配置 grid 行/列权重以使 log_area 可扩展
-		root.grid_rowconfigure(6, weight=1)
-		root.grid_columnconfigure(1, weight=1)
+    def _create_widgets(self):
+        """创建界面组件"""
+        # 主框架
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
 
-	def browse_dicom(self):
-		directory = filedialog.askdirectory()
-		if directory:
-			self.path_entry.delete(0, tk.END)
-			self.path_entry.insert(0, directory)
+        # 标题
+        title_label = ttk.Label(main_frame, text="DICOM 序列分割与 NIfTI 转换工具 v1.76", style="Title.TLabel")
+        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
 
-	def browse_save(self):
-		directory = filedialog.askdirectory()
-		if directory:
-			self.save_entry.delete(0, tk.END)
-			self.save_entry.insert(0, directory)
+        # DICOM 路径选择
+        ttk.Label(main_frame, text="DICOM Root Path:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(main_frame, textvariable=self.dicom_path_var, width=60).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+        ttk.Button(main_frame, text="Browse", command=self._browse_dicom_path).grid(row=1, column=2, pady=5)
 
-	def write_log(self, message):
-		self.log_area.configure(state="normal")
-		self.log_area.insert(tk.END, message + "\n")
-		self.log_area.configure(state="disabled")
-		self.log_area.yview(tk.END)
+        # 保存路径选择
+        ttk.Label(main_frame, text="NIFTI Save Path:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(main_frame, textvariable=self.save_path_var, width=60).grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+        ttk.Button(main_frame, text="Browse", command=self._browse_save_path).grid(row=2, column=2, pady=5)
 
-	@logger.catch
-	def run(self):
-		root_path = self.path_entry.get()
-		save_path = self.save_entry.get()
-		min_slices = self.min_slices_entry.get()
-		timeout = self.timeout_entry.get()
+        # 参数设置
+        param_frame = ttk.LabelFrame(main_frame, text="参数设置", padding="5")
+        param_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
 
-		if not root_path:
-			messagebox.showerror("Error", "Please select a DICOM root path")
-			return
-		if not save_path:
-			messagebox.showerror("Error", "Please select a save path")
-			return
-		if not min_slices.isdigit() or int(min_slices) <= 0:
-			messagebox.showerror(
-				"Error", "Minimum slices must be a positive integer"
-			)
-			return
-		if float(timeout) <= 0:
-			messagebox.showerror("Error", "Timeout must be a positive number")
-			return
+        ttk.Label(param_frame, text="Minimum Slices:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        ttk.Spinbox(param_frame, from_=1, to=1000, textvariable=self.min_slices_var, width=10).grid(row=0, column=1, padx=(0, 20))
 
-		self.run_button.config(state=tk.DISABLED)
+        ttk.Label(param_frame, text="Timeout (s):").grid(row=0, column=2, sticky=tk.W, padx=(0, 5))
+        ttk.Spinbox(param_frame, from_=1, to=60, textvariable=self.timeout_var, width=10).grid(row=0, column=3, padx=(0, 20))
 
-		thread = Thread(
-			target=self.run_splitter,
-			args=(root_path, save_path, int(min_slices), float(timeout)),
-		)
-		thread.start()
+        ttk.Label(param_frame, text="Threads:").grid(row=0, column=4, sticky=tk.W, padx=(0, 5))
+        ttk.Spinbox(param_frame, from_=1, to=16, textvariable=self.n_jobs_var, width=10).grid(row=0, column=5)
 
-	@logger.catch
-	def run_splitter(self, root_path, save_path, min_slices, timeout):
-		root_path = root_path.replace(os.sep, "/")
-		save_path = save_path.replace(os.sep, "/")
+        # 运行按钮
+        self.run_button = ttk.Button(main_frame, text="Run", command=self._run_processing)
+        self.run_button.grid(row=4, column=0, columnspan=3, pady=10)
 
-		meta_keys = [
-			"PatientID",
-			"StudyID",
-			"AccessionNumber",
-			"ProtocolName",
-			"SeriesInstanceUID",
-			"SliceLocation",
-			"InstanceNumber",
-			"SeriesNumber",
-			"SeriesDescription",
-			"AcquisitionTime",
-		]
+        # 日志区域
+        ttk.Label(main_frame, text="Processing Log:").grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(10, 5))
 
-		split = DicomSeriesSplit(
-			timeout=timeout,
-			n_jobs=8,
-			min_slices=min_slices,
-			meta_keys=meta_keys,
-			backend="spawn",
-			# will_save_file_keys=["SeriesDescription"],
-			will_save_file_keys=[
-				"SeriesDescription",
-				"ProtocolName",
-				"AcquisitionTime",
-			],
-			will_save_folder_keys=["PatientID", "AccessionNumber"],
-			will_save_root_path=save_path,
-		)
+        log_frame = ttk.Frame(main_frame, style="Log.TFrame")
+        log_frame.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S))
+        main_frame.grid_rowconfigure(6, weight=1)
+        main_frame.grid_columnconfigure(1, weight=1)
 
-		try:
-			split_files = split(root_path)
-			for split_file in split_files:
-				split_file.to_save_nifti()
-			messagebox.showinfo(
-				"Success", "DICOM splitting and saving completed."
-			)
-		except Exception as e:
-			messagebox.showerror("Error", f"An error occurred: {e}")
-		finally:
-			self.run_button.config(state=tk.NORMAL)
+        # 日志文本框
+        self.log_text = tk.Text(log_frame, wrap=tk.WORD, bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 9))
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        log_frame.grid_rowconfigure(0, weight=1)
+        log_frame.grid_columnconfigure(0, weight=1)
+
+        # 滚动条
+        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+
+    def _setup_logging(self):
+        """设置日志重定向到 GUI"""
+        self.gui_handler = GuiLogHandler(self.log_text, self.log_queue)
+
+        # 添加 GUI 处理器 - 使用唯一标识避免重复
+        logger.add(
+            self.gui_handler,
+            format="{time:HH:mm:ss} | {level: <8} | {message}",
+            level="INFO",
+            filter=lambda record: True,
+            enqueue=True  # 使用队列避免线程问题
+        )
+
+    def _update_log(self):
+        """更新日志显示"""
+        try:
+            while True:
+                message = self.log_queue.get_nowait()
+                self.log_text.insert(tk.END, message)
+                # 限制日志行数
+                lines = int(self.log_text.index('end-1c').split('.')[0])
+                if lines > 1000:
+                    self.log_text.delete(1.0, f"{lines - 900}.0")
+                self.log_text.see(tk.END)
+        except queue.Empty:
+            pass
+
+        self._log_after_id = self.root.after(100, self._update_log)
+
+    def _browse_dicom_path(self):
+        """浏览 DICOM 路径"""
+        path = filedialog.askdirectory(title="Select DICOM Root Directory")
+        if path:
+            self.dicom_path_var.set(path)
+
+    def _browse_save_path(self):
+        """浏览保存路径"""
+        path = filedialog.askdirectory(title="Select NIfTI Save Directory")
+        if path:
+            self.save_path_var.set(path)
+
+    def _validate_inputs(self) -> Tuple[bool, str]:
+        """验证输入参数"""
+        dicom_path = self.dicom_path_var.get().strip()
+        save_path = self.save_path_var.get().strip()
+
+        if not dicom_path:
+            return False, "请选择 DICOM 根目录"
+
+        if not save_path:
+            return False, "请选择 NIfTI 保存目录"
+
+        if not os.path.isdir(dicom_path):
+            return False, "DICOM 路径不是有效的目录"
+
+        if not os.path.exists(save_path):
+            try:
+                os.makedirs(save_path, exist_ok=True)
+            except Exception as e:
+                return False, f"无法创建保存目录: {e}"
+
+        # 检查保存路径是否可写
+        try:
+            test_file = os.path.join(save_path, ".test_write_permission")
+            with open(test_file, "w") as f:
+                f.write("test")
+            os.remove(test_file)
+        except Exception:
+            return False, "保存目录没有写入权限，请检查权限设置"
+
+        # 验证数值参数
+        if self.min_slices_var.get() < 1:
+            return False, "最小切片数必须大于等于 1"
+
+        if self.timeout_var.get() < 1:
+            return False, "超时时间必须大于等于 1 秒"
+
+        return True, ""
+
+    def _run_processing_thread(self):
+        """在后台线程中运行处理"""
+        try:
+            dicom_path = self.dicom_path_var.get().strip()
+            save_path = self.save_path_var.get().strip()
+
+            logger.info("=" * 60)
+            logger.info("开始处理")
+            logger.info(f"DICOM 路径: {dicom_path}")
+            logger.info(f"保存路径: {save_path}")
+            logger.info(f"最小切片数: {self.min_slices_var.get()}")
+            logger.info(f"超时时间: {self.timeout_var.get()} 秒")
+            logger.info(f"并行线程: {self.n_jobs_var.get()}")
+            logger.info("=" * 60)
+
+            # 创建分割器
+            splitter = DicomSeriesSplit(
+                timeout=self.timeout_var.get(),
+                n_jobs=self.n_jobs_var.get(),
+                min_slices=self.min_slices_var.get(),
+                will_save_root_path=save_path
+            )
+
+            # 处理文件
+            start_time = time.time()
+            split_list = splitter(dicom_path)
+            end_time = time.time()
+
+            # 保存 NIfTI
+            if split_list:
+                logger.info(f"开始保存 {len(split_list)} 个序列...")
+                saved_count = 0
+                failed_count = 0
+
+                # 按病人/检查号分组，重置索引
+                folder_groups: Dict[str, List[SeriesData]] = {}
+                for series in split_list:
+                    folder_name = series.get_folder_name()
+                    if folder_name not in folder_groups:
+                        folder_groups[folder_name] = []
+                    folder_groups[folder_name].append(series)
+
+                for folder_name, series_list in folder_groups.items():
+                    for idx, series in enumerate(series_list):
+                        saved_path = series.to_save_nifti(index=idx)
+                        if saved_path:
+                            saved_count += 1
+                        else:
+                            failed_count += 1
+
+                logger.info(f"处理完成！成功保存 {saved_count} 个，失败 {failed_count} 个")
+            else:
+                logger.warning("没有找到符合条件的序列")
+
+            logger.info(f"总耗时: {end_time - start_time:.2f} 秒")
+
+            # 在主线程中显示完成消息
+            self.root.after(0, lambda: self._show_completion_message(len(split_list)))
+
+        except Exception as e:
+            logger.error(f"处理失败: {str(e)}", exc_info=True)
+            self.root.after(0, lambda: self._show_error_message(str(e)))
+        finally:
+            self.root.after(0, self._reset_ui)
+
+    def _show_completion_message(self, count: int):
+        """显示完成消息"""
+        messagebox.showinfo("Success", f"处理完成！\n共保存 {count} 个 NIfTI 文件。")
+
+    def _show_error_message(self, error: str):
+        """显示错误消息"""
+        messagebox.showerror("Error", f"处理失败:\n{error}")
+
+    def _reset_ui(self):
+        """重置 UI 状态"""
+        self.running = False
+        self.run_button.config(state=tk.NORMAL)
+
+    def _run_processing(self):
+        """运行处理流程"""
+        if self.running:
+            return
+
+        # 验证输入
+        is_valid, error_msg = self._validate_inputs()
+        if not is_valid:
+            messagebox.showerror("Error", error_msg)
+            return
+
+        self.running = True
+        self.run_button.config(state=tk.DISABLED)
+        self.log_text.delete(1.0, tk.END)
+
+        # 在后台线程中运行处理，避免阻塞 GUI
+        thread = Thread(target=self._run_processing_thread, daemon=True)
+        thread.start()
+
+    def on_closing(self):
+        """窗口关闭处理"""
+        if self._log_after_id:
+            self.root.after_cancel(self._log_after_id)
+        if self.gui_handler:
+            self.gui_handler.stop()
+        self.root.destroy()
+
+
+# -------------------------- 主程序入口 --------------------------
+def main():
+    """主程序入口"""
+    try:
+        root = tk.Tk()
+        app = DicomApp(root)
+
+        # 设置关闭处理
+        root.protocol("WM_DELETE_WINDOW", app.on_closing)
+
+        root.mainloop()
+    except KeyboardInterrupt:
+        logger.info("程序被用户中断")
+        sys.exit(0)
+    except Exception as e:
+        logger.critical(f"程序崩溃: {str(e)}", exc_info=True)
+        messagebox.showerror("Fatal Error", f"程序发生严重错误:\n{str(e)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-	# freeze_support()
-
-	root = tk.Tk()
-	app = DicomApp(root)
-
-	class LogHandler:
-		def __init__(self, app):
-			self.app = app
-
-		def write(self, message):
-			if message.strip():  # ignore empty messages
-				self.app.write_log(message.strip())
-
-		def flush(self):
-			pass
-
-	log_save_path = "log"
-	os.makedirs(log_save_path, exist_ok=True)
-	logger.remove()
-	logger.add(log_save_path + "/dicom_splitter_app.log", rotation="100 MB")
-	logger.add(LogHandler(app))
-	root.mainloop()
-
-# pyinstaller -F -w --hiddenimport=pydicom.encoders.gdcm --hiddenimport=pydicom.encoders.pylibjpeg app.1.74.py -n DicomSplitter1.74.exe
-
-# 同反相位 同时存在 AcquisitionNumber 和 SliceLocation 可分情况，使用 AcquisitionNumber 拆分会导致拆分错误，增加了 判断条件 此时使用 SliceLocation 拆分
+    main()
